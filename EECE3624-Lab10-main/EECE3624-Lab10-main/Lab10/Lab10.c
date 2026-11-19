@@ -1,101 +1,167 @@
 /*****************************************************************************
- *	    File: Lab10.c
- *  Lab Name: RS232/BT Communication Tester
- *    Author: Dr. Greg Nordstrom & Prof. John Hutton
- *   Created: 12/30/17
- *  Modified: 3/28/19, 1/17/21, 11/13/2023
- * Processor: ATmega128A (on the ReadyAVR board)
+ * File: FinalProject_AVR_Controller.c
  *
- * This program implements a communication server by reading a character
- * from a UART Terminal and reflecting that character to the BT UART
- * device.
+ * Purpose:
+ * Read ReadyAVR joystick inputs and send commands
+ * over Bluetooth to the Zumo robot.
  *
- * This program depends on the UARTLibrary used in previous labs, but
- * students are required to create and use their own UARTLibrary.c file,
- * but must use the UARTLibrary.h file that was given to them in Lab07.
+ * Commands:
+ * F = Forward
+ * B = Back
+ * L = Left
+ * R = Right
+ * S = Stop
+ * C = Center press
  *
- * NOTE:  Since we skipped Lab08 this year (2023-Fall), I'm providing 
- * the USARTLibrary.a file from Lab07.
- *
- * In other words, their routines must conform to the prototypes they
- * have previously used.
- *
- * NB: The ReadyAVR-64 board uses UART1 as the default for programming,
- * freeing uart1 for external RS232 traffic (e.g. like adding the Bluetooth
- * transceivers in Lab09).
- *
- *   UART1 for communication to a Putty Terminal
- *   UART0 for communication across the paired BT channel.
+ * UART1 - PuTTY Debug
+ * UART0 - Bluetooth
  *****************************************************************************/
 
-// define CPU speed (7.3728 MHz for the ATmega128A)
-#define F_CPU   7372800UL
+#define F_CPU 7372800UL
 
-#define END_STRING  '\0'
-#define CR          0x0D
-#define LF          0x0A
-#define ESC         0x1B
+#define END_STRING '\0'
+#define CR         0x0D
+#define LF         0x0A
 
 #include <avr/io.h>
+#include <stdint.h>
 #include <util/delay.h>
-#include <stdio.h>  // for sprintf functionality
+
 #include "UARTLibrary.h"
 #include "UART0Library.h"
 
-//#define BAUDRATE    19200 // standard values from 1200 to 115200
-//#define DATABITS        7 // 5-8
-//#define STOPBITS        1 // 1,2
-//#define PARITY          0 // 0=none, 1=odd, 2=even
+//UART Settings
+#define BAUDRATE   9600
+#define DATABITS   8
+#define STOPBITS   1
+#define PARITY     0
 
-#define BAUDRATE   9600 // standard values from 1200 to 115200
-#define DATABITS      8 // 5-8
-#define STOPBITS      1 // 1,2
-#define PARITY        0 // 0=none, 1=odd, 2=even
+void send_string(const char *cp);
+char ReadJoystick(void);
+static void release_pd3(void);
+static void debug_enable(void);
+static void debug_disable(void);
+static void debug_send_cmd(char c);
 
-char text[40];
-
-void send_string(const char *cp) {
-	while(*cp != END_STRING) {
-		uart_tx(*cp++);
-	}
+void send_string(const char *cp)
+{	
+	while(*cp != END_STRING)
+    {	uart_tx(*cp++);
+    }
 }
 
-int main(void) {
-	char rcvdChar;
-	const char resetMsg[] = "\r\nRS232/BT Test Reflector.\r\n\0";
-	
-	// For simplicity, use the same setup information for both ports.
-	// Init UART1 for debug information to Putty
-    uart_init(BAUDRATE,DATABITS,STOPBITS,PARITY);
-	//uart_tx('a');
-	
-	// Init UART0 for BT/UART path
-	uart0_init(BAUDRATE,DATABITS,STOPBITS,PARITY);
-	//while(1) {
-		//uart0_tx('a');
-		//_delay_ms(1000);
-	//}
-	
-	send_string(resetMsg);
-	
-	while(1)
-	{
-		// wait for a character
-		rcvdChar = uart_rx();
-		
-		switch(rcvdChar)
-		{
-			case CR:
-				// send back both CR and LF (makes PuTTY work without having to assume CRs w/ LFs)
-				uart_tx(CR);	// echo char back to sender
-				uart_tx(LF);	// echo char back to sender
-				break;					
-			default:
-				// Echo normal character back to terminal
-				uart_tx(rcvdChar);
-				// Send character to BT Device (Zumo)
-				uart0_tx(rcvdChar);
-		}
-	}
-	return 0;
+static void release_pd3(void) //Return PD3 to ordinary pulled-up input so PB3 (UP) can be read
+{
+    DDRD  &= ~(1 << PD3);   // input
+    PORTD |=  (1 << PD3);   // pull-up
+}
+
+static void debug_enable(void) //PD3 being used in UART1
+{
+    UCSR1A |= (1 << TXC1);
+    UCSR1B |= (1 << TXEN1);
+}
+
+static void debug_disable(void) //PD3 used in UART0 again
+{
+    while(!(UCSR1A & (1 << TXC1)));
+    UCSR1A |= (1 << TXC1);
+    UCSR1B &= ~(1 << TXEN1);
+    release_pd3();
+}
+
+static void debug_send_cmd(char c) //send character to PuTTY
+{
+    debug_enable();
+    uart_tx(c);
+    uart_tx(CR);
+    uart_tx(LF);
+    debug_disable();
+}
+
+char ReadJoystick(void) //active low
+{
+    if(!(PINB & (1 << PB4))) //center
+        return 'C';
+
+    if(!(PINB & (1 << PB1))) //down
+        return 'B';
+
+    if(!(PINB & (1 << PB2))) //left
+        return 'L';
+
+    if(!(PINB & (1 << PB0))) //right
+        return 'R';
+
+    if(!(PINB & (1 << PB3))) //up
+        return 'F';
+
+    return 'S'; // stop
+}
+
+int main(void)
+{
+    char currentCmd;
+    char previousCmd = 'X';
+
+    // UART1 -> PuTTY
+    uart_init(
+        BAUDRATE,
+        DATABITS,
+        STOPBITS,
+        PARITY
+    );
+
+    // UART0 -> Bluetooth
+    uart0_init(
+        BAUDRATE,
+        DATABITS,
+        STOPBITS,
+        PARITY
+    );
+
+    // Startup banner
+    debug_enable();
+    send_string("\r\nReadyAVR Bluetooth Controller\r\n");
+    debug_disable();
+
+    // configure joystick pins after UART init so nothing overrides them
+    DDRB &= ~(
+        (1 << PB0) |
+        (1 << PB1) |
+        (1 << PB2) |
+        (1 << PB3) |
+        (1 << PB4)
+    );
+
+    PORTB |= (
+        (1 << PB0) |
+        (1 << PB1) |
+        (1 << PB2) |
+        (1 << PB3) |
+        (1 << PB4)
+    );
+
+    release_pd3();
+
+    while(1)
+    {	currentCmd = ReadJoystick();
+
+        if(currentCmd != previousCmd)
+        {	uart0_tx(currentCmd);
+
+            if(previousCmd == 'F')
+                debug_send_cmd('F');
+
+            // UP is held
+            if(currentCmd != 'F')
+                debug_send_cmd(currentCmd);
+
+            previousCmd = currentCmd;
+        }
+
+        _delay_ms(20);
+    }
+
+    return 0;
 }
